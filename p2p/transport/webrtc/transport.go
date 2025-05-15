@@ -27,7 +27,7 @@ import (
 	tpt "github.com/libp2p/go-libp2p/core/transport"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	libp2pquic "github.com/libp2p/go-libp2p/p2p/transport/quic"
-	"github.com/libp2p/go-libp2p/p2p/transport/webrtc/pb"
+	"p2phttp-server/lib/webrtc/pb"
 	"github.com/libp2p/go-msgio"
 
 	ma "github.com/multiformats/go-multiaddr"
@@ -106,89 +106,85 @@ type iceTimeouts struct {
 
 type ListenUDPFn func(network string, laddr *net.UDPAddr) (net.PacketConn, error)
 
-func New(
-	privKey ic.PrivKey,
-	psk pnet.PSK,
-	gater connmgr.ConnectionGater,
-	rcmgr network.ResourceManager,
-	listenUDP ListenUDPFn,
-	customCert *webrtc.Certificate,
-	opts ...Option) (*WebRTCTransport, error) {
-	if psk != nil {
-		log.Error("WebRTC doesn't support private networks yet.")
-		return nil, fmt.Errorf("WebRTC doesn't support private networks yet")
-	}
-	if rcmgr == nil {
-		rcmgr = &network.NullResourceManager{}
-	}
-	localPeerID, err := peer.IDFromPrivateKey(privKey)
-	if err != nil {
-		return nil, fmt.Errorf("get local peer ID: %w", err)
-	}
-	// We use elliptic P-256 since it is widely supported by browsers.
-	//
-	// Implementation note: Testing with the browser,
-	// it seems like Chromium only supports ECDSA P-256 or RSA key signatures in the webrtc TLS certificate.
-	// We tried using P-228 and P-384 which caused the DTLS handshake to fail with Illegal Parameter
-	//
-	// Please refer to this is a list of suggested algorithms for the WebCrypto API.
-	// The algorithm for generating a certificate for an RTCPeerConnection
-	// must adhere to the WebCrpyto API. From my observation,
-	// RSA and ECDSA P-256 is supported on almost all browsers.
-	// Ed25519 is not present on the list.
-	// pk, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	// if err != nil {
-	// 	return nil, fmt.Errorf("generate key for cert: %w", err)
-	// }
-	// cert, err := webrtc.GenerateCertificate(pk)
-	// if err != nil {
-	// 	return nil, fmt.Errorf("generate certificate: %w", err)
-	// }
+func WithCustomCert(cert *webrtc.Certificate) Option {
+    return func(t *WebRTCTransport) error {
+        if cert == nil {
+            return fmt.Errorf("custom certificate cannot be nil")
+        }
+        if _, err := cert.GetFingerprints(); err != nil {
+            return fmt.Errorf("invalid custom certificate: %w", err)
+        }
+        t.webrtcConfig.Certificates = []webrtc.Certificate{*cert}
+        return nil
+    }
+}
 
-	var cert *webrtc.Certificate
-    if customCert == nil {
+func New(
+    privKey ic.PrivKey,
+    psk pnet.PSK,
+    gater connmgr.ConnectionGater,
+    rcmgr network.ResourceManager,
+    listenUDP ListenUDPFn,
+    opts ...Option) (*WebRTCTransport, error) {
+    if psk != nil {
+        log.Error("WebRTC doesn't support private networks yet.")
+        return nil, fmt.Errorf("WebRTC doesn't support private networks yet")
+    }
+    if rcmgr == nil {
+        rcmgr = &network.NullResourceManager{}
+    }
+    localPeerID, err := peer.IDFromPrivateKey(privKey)
+    if err != nil {
+        return nil, fmt.Errorf("get local peer ID: %w", err)
+    }
+
+    // Initialize webrtc.Configuration with no certificates; will be set by options or default
+    config := webrtc.Configuration{}
+
+    // Create noise transport
+    noiseTpt, err := noise.New(noise.ID, privKey, nil)
+    if err != nil {
+        return nil, fmt.Errorf("unable to create noise transport: %w", err)
+    }
+
+    // Initialize transport
+    transport := &WebRTCTransport{
+        rcmgr:        rcmgr,
+        gater:        gater,
+        webrtcConfig: config,
+        privKey:      privKey,
+        noiseTpt:     noiseTpt,
+        localPeerId:  localPeerID,
+        listenUDP:    listenUDP,
+        peerConnectionTimeouts: iceTimeouts{
+            Disconnect: DefaultDisconnectedTimeout,
+            Failed:     DefaultFailedTimeout,
+            Keepalive:  DefaultKeepaliveTimeout,
+        },
+        maxInFlightConnections: DefaultMaxInFlightConnections,
+    }
+
+    // Apply options
+    for _, opt := range opts {
+        if err := opt(transport); err != nil {
+            return nil, err
+        }
+    }
+
+    // Generate default certificate if none provided
+    if len(transport.webrtcConfig.Certificates) == 0 {
         pk, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
         if err != nil {
             return nil, fmt.Errorf("generate key for cert: %w", err)
         }
-        cert, err = webrtc.GenerateCertificate(pk)
+        defaultCert, err := webrtc.GenerateCertificate(pk)
         if err != nil {
             return nil, fmt.Errorf("generate certificate: %w", err)
         }
-    } else {
-        cert = customCert
+        transport.webrtcConfig.Certificates = []webrtc.Certificate{*defaultCert}
     }
 
-	config := webrtc.Configuration{
-		Certificates: []webrtc.Certificate{*cert},
-	}
-	noiseTpt, err := noise.New(noise.ID, privKey, nil)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create noise transport: %w", err)
-	}
-	transport := &WebRTCTransport{
-		rcmgr:        rcmgr,
-		gater:        gater,
-		webrtcConfig: config,
-		privKey:      privKey,
-		noiseTpt:     noiseTpt,
-		localPeerId:  localPeerID,
-
-		listenUDP: listenUDP,
-		peerConnectionTimeouts: iceTimeouts{
-			Disconnect: DefaultDisconnectedTimeout,
-			Failed:     DefaultFailedTimeout,
-			Keepalive:  DefaultKeepaliveTimeout,
-		},
-
-		maxInFlightConnections: DefaultMaxInFlightConnections,
-	}
-	for _, opt := range opts {
-		if err := opt(transport); err != nil {
-			return nil, err
-		}
-	}
-	return transport, nil
+    return transport, nil
 }
 
 func (t *WebRTCTransport) ListenOrder() int {
@@ -341,7 +337,7 @@ func (t *WebRTCTransport) dial(ctx context.Context, scope network.ConnManagement
 		t.peerConnectionTimeouts.Keepalive,
 	)
 	// By default, webrtc will not collect candidates on the loopback address.
-	// This is disallowed in the ICE specification. However, implementations
+	// This is disallowed in the  specification. However, implementations
 	// do not strictly follow this, for eg. Chrome gathers TCP loopback candidates.
 	// If you run pion on a system with only the loopback interface UP,
 	// it will not connect to anything.
