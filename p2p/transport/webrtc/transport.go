@@ -106,7 +106,14 @@ type iceTimeouts struct {
 
 type ListenUDPFn func(network string, laddr *net.UDPAddr) (net.PacketConn, error)
 
-func New(privKey ic.PrivKey, psk pnet.PSK, gater connmgr.ConnectionGater, rcmgr network.ResourceManager, listenUDP ListenUDPFn, opts ...Option) (*WebRTCTransport, error) {
+func New(
+	privKey ic.PrivKey,
+	psk pnet.PSK,
+	gater connmgr.ConnectionGater,
+	rcmgr network.ResourceManager,
+	listenUDP ListenUDPFn,
+	customCert *webrtc.Certificate,
+	opts ...Option) (*WebRTCTransport, error) {
 	if psk != nil {
 		log.Error("WebRTC doesn't support private networks yet.")
 		return nil, fmt.Errorf("WebRTC doesn't support private networks yet")
@@ -129,14 +136,29 @@ func New(privKey ic.PrivKey, psk pnet.PSK, gater connmgr.ConnectionGater, rcmgr 
 	// must adhere to the WebCrpyto API. From my observation,
 	// RSA and ECDSA P-256 is supported on almost all browsers.
 	// Ed25519 is not present on the list.
-	pk, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("generate key for cert: %w", err)
-	}
-	cert, err := webrtc.GenerateCertificate(pk)
-	if err != nil {
-		return nil, fmt.Errorf("generate certificate: %w", err)
-	}
+	// pk, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	// if err != nil {
+	// 	return nil, fmt.Errorf("generate key for cert: %w", err)
+	// }
+	// cert, err := webrtc.GenerateCertificate(pk)
+	// if err != nil {
+	// 	return nil, fmt.Errorf("generate certificate: %w", err)
+	// }
+
+	var cert *webrtc.Certificate
+    if customCert == nil {
+        pk, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+        if err != nil {
+            return nil, fmt.Errorf("generate key for cert: %w", err)
+        }
+        cert, err = webrtc.GenerateCertificate(pk)
+        if err != nil {
+            return nil, fmt.Errorf("generate certificate: %w", err)
+        }
+    } else {
+        cert = customCert
+    }
+
 	config := webrtc.Configuration{
 		Certificates: []webrtc.Certificate{*cert},
 	}
