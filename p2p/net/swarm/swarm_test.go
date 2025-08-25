@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -79,9 +80,8 @@ func makeSwarms(t *testing.T, num int, opts ...Option) []*swarm.Swarm {
 
 func connectSwarms(t *testing.T, ctx context.Context, swarms []*swarm.Swarm) {
 	var wg sync.WaitGroup
-	connect := func(s *swarm.Swarm, dst peer.ID, addr ma.Multiaddr) {
-		// TODO: make a DialAddr func.
-		s.Peerstore().AddAddr(dst, addr, peerstore.PermanentAddrTTL)
+	connect := func(s *swarm.Swarm, dst peer.ID, addrs []ma.Multiaddr) {
+		s.Peerstore().AddAddrs(dst, addrs, peerstore.TempAddrTTL)
 		if _, err := s.DialPeer(ctx, dst); err != nil {
 			t.Fatal("error swarm dialing to peer", err)
 		}
@@ -92,7 +92,7 @@ func connectSwarms(t *testing.T, ctx context.Context, swarms []*swarm.Swarm) {
 	for i, s1 := range swarms {
 		for _, s2 := range swarms[i+1:] {
 			wg.Add(1)
-			connect(s1, s2.LocalPeer(), s2.ListenAddresses()[0]) // try the first.
+			connect(s1, s2.LocalPeer(), s2.ListenAddresses())
 		}
 	}
 	wg.Wait()
@@ -250,7 +250,7 @@ func TestConnectionGating(t *testing.T) {
 		},
 		"p1 gates outbound peer dial": {
 			p1Gater: func(c *MockConnectionGater) *MockConnectionGater {
-				c.PeerDial = func(p peer.ID) bool { return false }
+				c.PeerDial = func(_ peer.ID) bool { return false }
 				return c
 			},
 			p1ConnectednessToP2: network.NotConnected,
@@ -259,7 +259,7 @@ func TestConnectionGating(t *testing.T) {
 		},
 		"p1 gates outbound addr dialing": {
 			p1Gater: func(c *MockConnectionGater) *MockConnectionGater {
-				c.Dial = func(p peer.ID, addr ma.Multiaddr) bool { return false }
+				c.Dial = func(_ peer.ID, _ ma.Multiaddr) bool { return false }
 				return c
 			},
 			p1ConnectednessToP2: network.NotConnected,
@@ -277,7 +277,7 @@ func TestConnectionGating(t *testing.T) {
 		},
 		"p2 gates inbound peer dial before securing": {
 			p2Gater: func(c *MockConnectionGater) *MockConnectionGater {
-				c.Accept = func(c network.ConnMultiaddrs) bool { return false }
+				c.Accept = func(_ network.ConnMultiaddrs) bool { return false }
 				return c
 			},
 			p1ConnectednessToP2: network.NotConnected,
@@ -297,7 +297,7 @@ func TestConnectionGating(t *testing.T) {
 		},
 		"p2 gates inbound peer dial after upgrading": {
 			p1Gater: func(c *MockConnectionGater) *MockConnectionGater {
-				c.Upgraded = func(c network.Conn) (bool, control.DisconnectReason) { return false, 0 }
+				c.Upgraded = func(_ network.Conn) (bool, control.DisconnectReason) { return false, 0 }
 				return c
 			},
 			p1ConnectednessToP2: network.NotConnected,
@@ -306,7 +306,7 @@ func TestConnectionGating(t *testing.T) {
 		},
 		"p2 gates outbound dials": {
 			p2Gater: func(c *MockConnectionGater) *MockConnectionGater {
-				c.PeerDial = func(p peer.ID) bool { return false }
+				c.PeerDial = func(_ peer.ID) bool { return false }
 				return c
 			},
 			p1ConnectednessToP2: network.Connected,
@@ -522,7 +522,7 @@ func TestResourceManagerAcceptStream(t *testing.T) {
 	rcmgr2 := mocknetwork.NewMockResourceManager(ctrl)
 	s2 := GenSwarm(t, WithSwarmOpts(swarm.WithResourceManager(rcmgr2)))
 	defer s2.Close()
-	s2.SetStreamHandler(func(str network.Stream) { t.Fatal("didn't expect to accept a stream") })
+	s2.SetStreamHandler(func(_ network.Stream) { t.Fatal("didn't expect to accept a stream") })
 
 	connectSwarms(t, context.Background(), []*swarm.Swarm{s1, s2})
 
@@ -567,4 +567,62 @@ func TestListenCloseCount(t *testing.T) {
 	require.Len(t, remainingAddrs, 1)
 	_, err := remainingAddrs[0].ValueForProtocol(ma.P_TCP)
 	require.NoError(t, err, "expected the TCP address to still be present")
+}
+
+func TestAddCertHashes(t *testing.T) {
+	s := GenSwarm(t)
+
+	listenAddrs := s.ListenAddresses()
+	splitCertHashes := func(a ma.Multiaddr) (prefix, certhashes ma.Multiaddr, ok bool) {
+		for i, c := range a {
+			if c.Protocol().Code == ma.P_CERTHASH {
+				return prefix, a[i:], true
+			}
+			prefix = append(prefix, c)
+		}
+		return prefix, certhashes, false
+	}
+	addrWithNewIPPort := func(addr ma.Multiaddr, newIPPort ma.Multiaddr) ma.Multiaddr {
+		a := slices.Clone(addr)
+		a[0] = newIPPort[0]
+		a[1] = newIPPort[1]
+		return a
+	}
+	publicIPPort := []ma.Multiaddr{
+		ma.StringCast("/ip4/1.1.1.1/udp/1"),
+		ma.StringCast("/ip4/1.2.3.4/udp/1"),
+		ma.StringCast("/ip6/2005::/udp/1"),
+	}
+
+	certHashComponent := ma.StringCast("/certhash/uEgNmb28")
+	for _, a := range listenAddrs {
+		prefix, certhashes, ok := splitCertHashes(a)
+		if !ok {
+			continue
+		}
+		var publicAddrs []ma.Multiaddr
+		for _, tc := range publicIPPort {
+			publicAddrs = append(publicAddrs, addrWithNewIPPort(prefix, tc))
+		}
+		finalAddrs := s.AddCertHashes(publicAddrs)
+		for _, a := range finalAddrs {
+			_, certhash2, ok := splitCertHashes(a)
+			require.True(t, ok)
+			require.Equal(t, certhashes, certhash2)
+		}
+
+		// if the addr has a certhash already, check it isn't modified
+		publicAddrs = nil
+		for _, tc := range publicIPPort {
+			a := addrWithNewIPPort(prefix, tc)
+			a = append(a, certHashComponent...)
+			publicAddrs = append(publicAddrs, a)
+		}
+		finalAddrs = s.AddCertHashes(publicAddrs)
+		for _, a := range finalAddrs {
+			_, certhash2, ok := splitCertHashes(a)
+			require.True(t, ok)
+			require.Equal(t, certHashComponent, certhash2)
+		}
+	}
 }

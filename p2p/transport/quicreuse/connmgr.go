@@ -2,13 +2,13 @@
 // for reusing QUIC transports for various purposes, like listening & dialing, having
 // multiple QUIC listeners on the same address with different ALPNs, and sharing the
 // same address with non QUIC transports like WebRTC.
+
 package quicreuse
 
 import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -20,10 +20,11 @@ import (
 	"github.com/quic-go/quic-go"
 	quiclogging "github.com/quic-go/quic-go/logging"
 	quicmetrics "github.com/quic-go/quic-go/metrics"
+	"golang.org/x/time/rate"
 )
 
 type QUICListener interface {
-	Accept(ctx context.Context) (quic.Connection, error)
+	Accept(ctx context.Context) (*quic.Conn, error)
 	Close() error
 	Addr() net.Addr
 }
@@ -32,13 +33,13 @@ var _ QUICListener = &quic.Listener{}
 
 type QUICTransport interface {
 	Listen(tlsConf *tls.Config, conf *quic.Config) (QUICListener, error)
-	Dial(ctx context.Context, addr net.Addr, tlsConf *tls.Config, conf *quic.Config) (quic.Connection, error)
+	Dial(ctx context.Context, addr net.Addr, tlsConf *tls.Config, conf *quic.Config) (*quic.Conn, error)
 	WriteTo(b []byte, addr net.Addr) (int, error)
 	ReadNonQUICPacket(ctx context.Context, b []byte) (int, net.Addr, error)
 	io.Closer
 }
 
-// ConnManager implements using the same listen address for both QUIC & WebTransport, reusing
+// ConnManager enables QUIC and WebTransport transports to listen on the same port, reusing
 // listen addresses for dialing, and provides a PacketConn for sharing the listen address
 // with other protocols like WebRTC.
 // Reusing the listen address for dialing helps with address discovery and hole punching. For details
@@ -62,8 +63,13 @@ type ConnManager struct {
 	quicListenersMu sync.Mutex
 	quicListeners   map[string]quicListenerEntry
 
-	srk      quic.StatelessResetKey
-	tokenKey quic.TokenGeneratorKey
+	srk         quic.StatelessResetKey
+	tokenKey    quic.TokenGeneratorKey
+	connContext connContextFunc
+
+	verifySourceAddress func(addr net.Addr) bool
+
+	qlogTracerDir string
 }
 
 type quicListenerEntry struct {
@@ -79,6 +85,11 @@ func defaultSourceIPSelectorFn() (SourceIPSelector, error) {
 	r, err := netroute.New()
 	return &netrouteSourceIPSelector{routes: r}, err
 }
+
+const (
+	unverifiedAddressNewConnectionRPS   = 1000
+	unverifiedAddressNewConnectionBurst = 1000
+)
 
 // NewConnManager returns a new ConnManager
 func NewConnManager(statelessResetKey quic.StatelessResetKey, tokenKey quic.TokenGeneratorKey, opts ...Option) (*ConnManager, error) {
@@ -103,15 +114,30 @@ func NewConnManager(statelessResetKey quic.StatelessResetKey, tokenKey quic.Toke
 
 	cm.clientConfig = quicConf
 	cm.serverConfig = serverConfig
+
+	// Verify source addresses when under high load.
+	// This is ensures that the number of spoofed/unverified addresses that are passed to downstream rate limiters
+	// are limited, which enables IP address based rate limiting.
+	sourceAddrRateLimiter := rate.NewLimiter(unverifiedAddressNewConnectionRPS, unverifiedAddressNewConnectionBurst)
+	vsa := cm.verifySourceAddress
+	cm.verifySourceAddress = func(addr net.Addr) bool {
+		if sourceAddrRateLimiter.Allow() {
+			if vsa != nil {
+				return vsa(addr)
+			}
+			return false
+		}
+		return true
+	}
 	if cm.enableReuseport {
-		cm.reuseUDP4 = newReuse(&statelessResetKey, &tokenKey, cm.listenUDP, cm.sourceIPSelectorFn)
-		cm.reuseUDP6 = newReuse(&statelessResetKey, &tokenKey, cm.listenUDP, cm.sourceIPSelectorFn)
+		cm.reuseUDP4 = newReuse(&statelessResetKey, &tokenKey, cm.listenUDP, cm.sourceIPSelectorFn, cm.connContext, cm.verifySourceAddress)
+		cm.reuseUDP6 = newReuse(&statelessResetKey, &tokenKey, cm.listenUDP, cm.sourceIPSelectorFn, cm.connContext, cm.verifySourceAddress)
 	}
 	return cm, nil
 }
 
 func (c *ConnManager) getTracer() func(context.Context, quiclogging.Perspective, quic.ConnectionID) *quiclogging.ConnectionTracer {
-	return func(ctx context.Context, p quiclogging.Perspective, ci quic.ConnectionID) *quiclogging.ConnectionTracer {
+	return func(_ context.Context, p quiclogging.Perspective, ci quic.ConnectionID) *quiclogging.ConnectionTracer {
 		var promTracer *quiclogging.ConnectionTracer
 		if c.enableMetrics {
 			switch p {
@@ -124,8 +150,14 @@ func (c *ConnManager) getTracer() func(context.Context, quiclogging.Perspective,
 			}
 		}
 		var tracer *quiclogging.ConnectionTracer
-		if qlogTracerDir != "" {
-			tracer = qloggerForDir(qlogTracerDir, p, ci)
+		var tracerDir = c.qlogTracerDir
+		if tracerDir == "" {
+			// Fallback to the global qlogTracerDir
+			tracerDir = qlogTracerDir
+		}
+
+		if tracerDir != "" {
+			tracer = qloggerForDir(tracerDir, p, ci)
 			if promTracer != nil {
 				tracer = quiclogging.NewMultiplexedConnectionTracer(promTracer,
 					tracer)
@@ -174,7 +206,7 @@ func (c *ConnManager) LendTransport(network string, tr QUICTransport, conn net.P
 
 // ListenQUIC listens for quic connections with the provided `tlsConf.NextProtos` ALPNs on `addr`. The same addr can be shared between
 // different ALPNs.
-func (c *ConnManager) ListenQUIC(addr ma.Multiaddr, tlsConf *tls.Config, allowWindowIncrease func(conn quic.Connection, delta uint64) bool) (Listener, error) {
+func (c *ConnManager) ListenQUIC(addr ma.Multiaddr, tlsConf *tls.Config, allowWindowIncrease func(conn *quic.Conn, delta uint64) bool) (Listener, error) {
 	return c.ListenQUICAndAssociate(nil, addr, tlsConf, allowWindowIncrease)
 }
 
@@ -184,7 +216,7 @@ func (c *ConnManager) ListenQUIC(addr ma.Multiaddr, tlsConf *tls.Config, allowWi
 // or `DialQUIC` calls with the same `association` will reuse the QUIC Transport used by this method.
 // A common use of associations is to ensure /quic dials use the quic listening address and /webtransport dials use the
 // WebTransport listening address.
-func (c *ConnManager) ListenQUICAndAssociate(association any, addr ma.Multiaddr, tlsConf *tls.Config, allowWindowIncrease func(conn quic.Connection, delta uint64) bool) (Listener, error) {
+func (c *ConnManager) ListenQUICAndAssociate(association any, addr ma.Multiaddr, tlsConf *tls.Config, allowWindowIncrease func(conn *quic.Conn, delta uint64) bool) (Listener, error) {
 	netw, host, err := manet.DialArgs(addr)
 	if err != nil {
 		return nil, err
@@ -200,7 +232,7 @@ func (c *ConnManager) ListenQUICAndAssociate(association any, addr ma.Multiaddr,
 	key := laddr.String()
 	entry, ok := c.quicListeners[key]
 	if !ok {
-		tr, err := c.transportForListen(association, netw, laddr)
+		tr, err := c.transportForListen(netw, laddr)
 		if err != nil {
 			return nil, err
 		}
@@ -210,20 +242,15 @@ func (c *ConnManager) ListenQUICAndAssociate(association any, addr ma.Multiaddr,
 		}
 		key = tr.LocalAddr().String()
 		entry = quicListenerEntry{ln: ln}
-	} else if c.enableReuseport && association != nil {
-		reuse, err := c.getReuse(netw)
-		if err != nil {
-			return nil, fmt.Errorf("reuse error: %w", err)
-		}
-		err = reuse.AssertTransportExists(entry.ln.transport)
-		if err != nil {
-			return nil, fmt.Errorf("reuse assert transport failed: %w", err)
-		}
-		if tr, ok := entry.ln.transport.(*refcountedTransport); ok {
-			tr.associate(association)
+	}
+	if c.enableReuseport && association != nil {
+		if _, ok := entry.ln.transport.(*refcountedTransport); !ok {
+			log.Warnf("reuseport is enabled, association is non-nil, but the transport is not a refcountedTransport.")
 		}
 	}
-	l, err := entry.ln.Add(tlsConf, allowWindowIncrease, func() { c.onListenerClosed(key) })
+	l, err := entry.ln.Add(association, tlsConf, allowWindowIncrease, func() {
+		c.onListenerClosed(key)
+	})
 	if err != nil {
 		if entry.refCount <= 0 {
 			entry.ln.Close()
@@ -272,7 +299,7 @@ func (c *ConnManager) SharedNonQUICPacketConn(_ string, laddr *net.UDPAddr) (net
 	return nil, errors.New("expected to be able to share with a QUIC listener, but the QUIC listener is not using a refcountedTransport. `DisableReuseport` should not be set")
 }
 
-func (c *ConnManager) transportForListen(association any, network string, laddr *net.UDPAddr) (RefCountedQUICTransport, error) {
+func (c *ConnManager) transportForListen(network string, laddr *net.UDPAddr) (RefCountedQUICTransport, error) {
 	if c.enableReuseport {
 		reuse, err := c.getReuse(network)
 		if err != nil {
@@ -282,7 +309,6 @@ func (c *ConnManager) transportForListen(association any, network string, laddr 
 		if err != nil {
 			return nil, err
 		}
-		tr.associate(association)
 		return tr, nil
 	}
 
@@ -290,16 +316,7 @@ func (c *ConnManager) transportForListen(association any, network string, laddr 
 	if err != nil {
 		return nil, err
 	}
-	return &singleOwnerTransport{
-		packetConn: conn,
-		Transport: &wrappedQUICTransport{
-			&quic.Transport{
-				Conn:              conn,
-				StatelessResetKey: &c.srk,
-				TokenGeneratorKey: &c.tokenKey,
-			},
-		},
-	}, nil
+	return c.newSingleOwnerTransport(conn), nil
 }
 
 type associationKey struct{}
@@ -317,7 +334,7 @@ func WithAssociation(ctx context.Context, association any) context.Context {
 // - Any other listening transport
 // - Any transport previously used for dialing
 // If none of these are available, it'll create a new transport.
-func (c *ConnManager) DialQUIC(ctx context.Context, raddr ma.Multiaddr, tlsConf *tls.Config, allowWindowIncrease func(conn quic.Connection, delta uint64) bool) (quic.Connection, error) {
+func (c *ConnManager) DialQUIC(ctx context.Context, raddr ma.Multiaddr, tlsConf *tls.Config, allowWindowIncrease func(conn *quic.Conn, delta uint64) bool) (*quic.Conn, error) {
 	naddr, v, err := FromQuicMultiaddr(raddr)
 	if err != nil {
 		return nil, err
@@ -378,11 +395,24 @@ func (c *ConnManager) TransportWithAssociationForDial(association any, network s
 		laddr = &net.UDPAddr{IP: net.IPv6zero, Port: 0}
 	}
 	conn, err := c.listenUDP(network, laddr)
-
 	if err != nil {
 		return nil, err
 	}
-	return &singleOwnerTransport{Transport: &wrappedQUICTransport{&quic.Transport{Conn: conn, StatelessResetKey: &c.srk}}, packetConn: conn}, nil
+	return c.newSingleOwnerTransport(conn), nil
+}
+
+func (c *ConnManager) newSingleOwnerTransport(conn net.PacketConn) *singleOwnerTransport {
+	return &singleOwnerTransport{
+		Transport: &wrappedQUICTransport{
+			Transport: newQUICTransport(
+				conn,
+				&c.tokenKey,
+				&c.srk,
+				c.connContext,
+				c.verifySourceAddress,
+			),
+		},
+		packetConn: conn}
 }
 
 // Protocols returns the supported QUIC protocols. The only supported protocol at the moment is /quic-v1.
@@ -413,4 +443,20 @@ var _ QUICTransport = (*wrappedQUICTransport)(nil)
 
 func (t *wrappedQUICTransport) Listen(tlsConf *tls.Config, conf *quic.Config) (QUICListener, error) {
 	return t.Transport.Listen(tlsConf, conf)
+}
+
+func newQUICTransport(
+	conn net.PacketConn,
+	tokenGeneratorKey *quic.TokenGeneratorKey,
+	statelessResetKey *quic.StatelessResetKey,
+	connContext connContextFunc,
+	verifySourceAddress func(addr net.Addr) bool,
+) *quic.Transport {
+	return &quic.Transport{
+		Conn:                conn,
+		TokenGeneratorKey:   tokenGeneratorKey,
+		StatelessResetKey:   statelessResetKey,
+		ConnContext:         connContext,
+		VerifySourceAddress: verifySourceAddress,
+	}
 }
